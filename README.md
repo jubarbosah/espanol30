@@ -11,4 +11,4 @@ App de flashcards (arquivo único, offline) para aprender espanhol peninsular pa
 
 Tudo roda no navegador, sem servidor. O progresso fica salvo no próprio aparelho.
 
-👉 **Abrir o app:** [https://USUARIO.github.io/REPO/](https://USUARIO.github.io/REPO/)
+👉 **Abrir o app:** [https://jubarbosah.github.io/espanol30/](https://jubarbosah.github.io/espanol30/)

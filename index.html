@@ -197,7 +197,11 @@
       <div style="text-align:right"><input type="range" id="sessionSize" min="8" max="60" step="2"><div class="desc" id="sessionSizeVal" style="text-align:right"></div></div>
     </div>
     <div class="row">
-      <div><div class="label">Direção do estudo</div><div class="desc">ES→PT reconhecer · PT→ES evocar (lacuna)</div></div>
+      <div><div class="label">Modo de estudo</div><div class="desc">Normal: ver e avaliar · Digitar: escrever em ES (mais esforço) · Ditado: só ouvir</div></div>
+      <select id="modeSel"><option value="normal">📖 Normal</option><option value="type">⌨ Digitar</option><option value="listen">🎧 Ditado</option></select>
+    </div>
+    <div class="row">
+      <div><div class="label">Direção do estudo</div><div class="desc">ES→PT reconhecer · PT→ES evocar (lacuna) · só vale no modo Normal</div></div>
       <select id="dirSel"><option value="es-pt">ES → PT</option><option value="pt-es">PT → ES</option></select>
     </div>
     <div class="row">
@@ -330,6 +334,21 @@ const EASE_START = 2.5, EASE_MIN = 1.3, EASE_MAX = 3.2;
 const GRAD_GOOD = 1, GRAD_EASY = 4, SECOND_IVL = 6; // dias
 const MATURE = 21;             // dias: a partir daqui a palavra é "dominada"
 
+// ===== FSRS-5 (mesmo algoritmo moderno do Anki) =====
+// Modela memória por estabilidade (s) e dificuldade (d) -> menos revisões p/ mesma retenção que SM-2.
+const FSRS_W=[0.40255,1.18385,3.173,15.69105,7.1949,0.5345,1.4604,0.0046,1.54575,0.1192,1.01925,1.9395,0.11,0.29605,2.2698,0.2315,2.9898,0.51655,0.6621];
+const FSRS_DECAY=-0.5, FSRS_FACTOR=Math.pow(0.9,1/FSRS_DECAY)-1, FSRS_RET=0.9; // retenção alvo 90%
+const clampD=d=>Math.max(1,Math.min(10,d));
+function fsrsInitS(g){ return Math.max(0.1, FSRS_W[g-1]); }            // g: 1..4
+function fsrsInitD(g){ return clampD(FSRS_W[4]-Math.exp(FSRS_W[5]*(g-1))+1); }
+function fsrsR(t,s){ return Math.pow(1+FSRS_FACTOR*Math.max(0,t)/Math.max(s,0.01), FSRS_DECAY); }
+function fsrsIvl(s){ return Math.max(1, Math.round(s/FSRS_FACTOR*(Math.pow(FSRS_RET,1/FSRS_DECAY)-1))); }
+function fsrsNextD(d,g){ const dl=d+(-FSRS_W[6]*(g-3))*(10-d)/9; return clampD(FSRS_W[7]*fsrsInitD(4)+(1-FSRS_W[7])*dl); }
+function fsrsRecallS(d,s,r,g){ const hard=g===2?FSRS_W[15]:1, easy=g===4?FSRS_W[16]:1;
+  return s*(1+Math.exp(FSRS_W[8])*(11-d)*Math.pow(s,-FSRS_W[9])*(Math.exp((1-r)*FSRS_W[10])-1)*hard*easy); }
+function fsrsForgetS(d,s,r){ const sf=FSRS_W[11]*Math.pow(d,-FSRS_W[12])*(Math.pow(s+1,FSRS_W[13])-1)*Math.exp((1-r)*FSRS_W[14]); return Math.min(sf,s); }
+function fsrsGraduate(p,g,now){ p.learning=false; p.s=fsrsInitS(g); p.d=fsrsInitD(g); p.reps=(p.reps||0)+1; p.ivl=fsrsIvl(p.s); p.last=now; p.due=now+p.ivl*DAY; }
+
 /* ============ STATE ============ */
 let state = load();
 let deck = {type:"all"};
@@ -347,7 +366,7 @@ function load(){
   try{ s = JSON.parse(localStorage.getItem(LS)); }catch(e){}
   if(!s) s = {};
   s.prog   = s.prog   || {};      // id -> {box,due,reps,lapses,intro,introDay}
-  s.cfg    = Object.assign({newLimit:15, autoplay:true, voice:null, rate:0.9, dir:"es-pt", showCtx:true, sessionSize:18}, s.cfg||{});
+  s.cfg    = Object.assign({newLimit:15, autoplay:true, voice:null, rate:0.9, dir:"es-pt", showCtx:true, sessionSize:18, studyMode:"normal"}, s.cfg||{});
   s.streak = s.streak || 0;
   s.lastDay= s.lastDay || null;
   s.history= s.history || {};     // dayStr -> count reviewed
@@ -373,37 +392,37 @@ function P(id){
   }
   return p;
 }
-// ===== Agendador SM-2 =====
+// ===== Agendador FSRS-5 =====
 function schedule(p, grade){ // grade: 0 Errei · 1 Difícil · 2 Bom · 3 Fácil
-  const now=Date.now();
+  const now=Date.now(); const G=grade+1; // FSRS: 1 Again · 2 Hard · 3 Good · 4 Easy
   if(!p.intro){ p.intro=true; if(!p.introDay) p.introDay=todayStr(); }
-  if(p.ease==null) p.ease=EASE_START;
   if(p.learning==null) p.learning = (p.ivl||0)<1;
-  if(grade===0){ // Errei -> volta pros passos curtos, reduz ease
-    if(!p.learning) p.lapses=(p.lapses||0)+1;
-    p.ease=Math.max(EASE_MIN, p.ease-0.20);
-    p.learning=true; p.step=0; p.ivl=0; p.due=now+LEARN_STEPS[0]*MIN;
-    return;
-  }
+  // ---- aprendizado / reaprendizado (passos no mesmo dia) ----
   if(p.learning){
+    if(grade===0){ p.step=0; p.due=now+LEARN_STEPS[0]*MIN; return; }
     if(grade===1){ p.due=now+LEARN_STEPS[Math.min(p.step||0,LEARN_STEPS.length-1)]*MIN; return; }
     if(grade===2){
       const nx=(p.step||0)+1;
-      if(nx>=LEARN_STEPS.length){ p.learning=false; p.ivl=GRAD_GOOD; p.reps=(p.reps||0)+1; p.due=now+GRAD_GOOD*DAY; }
+      if(nx>=LEARN_STEPS.length){ fsrsGraduate(p,3,now); } // gradua com "Bom"
       else { p.step=nx; p.due=now+LEARN_STEPS[nx]*MIN; }
       return;
     }
-    // Fácil: gradua já
-    p.learning=false; p.ivl=GRAD_EASY; p.ease=Math.min(EASE_MAX,p.ease+0.15); p.reps=(p.reps||0)+1; p.due=now+GRAD_EASY*DAY;
+    fsrsGraduate(p,4,now); return; // Fácil: gradua já como "Easy"
+  }
+  // ---- revisão graduada (FSRS) ----
+  if(p.s==null){ p.s=Math.max(1,p.ivl||1); p.d=(p.d!=null)?p.d:5; } // migração de cards antigos (SM-2)
+  const t=Math.max(0,(now-(p.last||now))/DAY);
+  const r=fsrsR(t,p.s);
+  if(grade===0){ // Errei -> lapso: reduz estabilidade e volta a reaprender
+    p.lapses=(p.lapses||0)+1;
+    p.s=fsrsForgetS(p.d,p.s,r); p.d=fsrsNextD(p.d,1);
+    p.learning=true; p.step=0; p.ivl=0; p.last=now; p.due=now+LEARN_STEPS[0]*MIN;
     return;
   }
-  // revisão (já graduado)
-  p.reps=(p.reps||0)+1;
-  let ivl=p.ivl||1;
-  if(grade===1){ p.ease=Math.max(EASE_MIN,p.ease-0.15); ivl=Math.max(1,Math.round(ivl*1.2)); }
-  else if(grade===2){ ivl = ivl<=1 ? SECOND_IVL : Math.round(ivl*p.ease); }
-  else { p.ease=Math.min(EASE_MAX,p.ease+0.15); ivl = ivl<=1 ? Math.round(SECOND_IVL*1.3) : Math.round(ivl*p.ease*1.3); }
-  p.ivl=Math.max(1,ivl); p.due=now+p.ivl*DAY;
+  const newD=fsrsNextD(p.d,G);
+  p.s=fsrsRecallS(p.d,p.s,r,G); // estabilidade usa a dificuldade anterior
+  p.d=newD; p.reps=(p.reps||0)+1;
+  p.ivl=fsrsIvl(p.s); p.last=now; p.due=now+p.ivl*DAY;
 }
 // rótulo do próximo intervalo (preview no botão), sem alterar o card
 function previewLabel(p, grade){
@@ -419,8 +438,10 @@ function previewLabel(p, grade){
 function isMature(p){ return !p.learning && (p.ivl||0)>=MATURE; }
 
 /* ============ CARDS (base + pessoais) ============ */
+// numerais (cardinais/ordinais) — usuária já domina; escondidos do baralho e das estatísticas
+const HIDDEN_IDS = new Set([323,324,325,326,327,328,329,330,331,332]);
 let CARDS_ALL = CARDS.slice();
-function rebuildCards(){ CARDS_ALL = CARDS.concat(typeof VERBS!=="undefined"?VERBS:[], state.userCards); }
+function rebuildCards(){ CARDS_ALL = CARDS.concat(typeof VERBS!=="undefined"?VERBS:[], state.userCards).filter(c=>!HIDDEN_IDS.has(c.id)); }
 
 /* ============ DECK FILTER ============ */
 function inDeck(c){
@@ -505,8 +526,33 @@ function render(){
                 : lvl==="parecida" ? `<div class="hint" style="color:#fcd34d">🟡 parecida com o português</div>` : "";
   const knowBtn = (isNew && !c.ff) ? `<button class="ghostbtn" id="knowBtn" style="margin-top:10px;padding:9px 16px;font-size:13px">✓ Já sei essa — próxima</button>` : "";
 
-  let frontHtml, answerHtml;
-  if(dir==="es-pt"){
+  const mode = practiceMode ? "normal" : (state.cfg.studyMode||"normal");
+  const rel = relBadge(c);   // relação com o português (sempre no verso)
+  let frontHtml, answerHtml, controlsHtml, modeTag="";
+
+  if(mode==="type"){
+    // DIGITAÇÃO: vê o português, escreve em espanhol (evocação ativa)
+    modeTag='<span class="tag" style="margin-left:auto;background:rgba(56,189,248,.18);color:var(--accent)">⌨ digitar</span>';
+    frontHtml = `
+       <div class="word">${esc(c.pt)}</div>
+       ${ptAlt}
+       <div class="hint">escreva em espanhol · Enter para responder</div>`;
+    answerHtml = `<div class="pt" style="font-size:30px;color:#fff">${esc(c.esp)}</div>
+       <button class="audiobtn" id="audioBtn" style="margin:8px auto 4px">🔊</button>
+       ${exHtml}${trapHtml}${notesHtml}${rel}`;
+    controlsHtml = `<div class="typewrap" style="display:flex;gap:8px">
+       <input id="typeIn" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="escreva em espanhol…" style="flex:1;min-width:0;padding:13px 14px;font-size:17px;border-radius:14px;border:1px solid rgba(148,163,184,.35);background:rgba(15,23,42,.6);color:#fff;outline:none">
+       <button class="revealbtn" id="typeGo" style="margin:0;white-space:nowrap;padding:0 18px">Responder</button></div>`;
+  } else if(mode==="listen"){
+    // DITADO: só ouve o áudio e lembra o significado (treino de ouvido)
+    modeTag='<span class="tag" style="margin-left:auto;background:rgba(56,189,248,.18);color:var(--accent)">🎧 ditado</span>';
+    frontHtml = `
+       <button class="audiobtn" id="audioBtn" style="font-size:34px;width:74px;height:74px">🔊</button>
+       <div class="hint" style="margin-top:14px">ouça e lembre o significado · toque para repetir</div>`;
+    answerHtml = `<div class="word" style="font-size:30px">${esc(c.esp)}</div>
+       <div class="pt">${esc(c.pt)}</div>${ptAlt}${exHtml}${trapHtml}${notesHtml}${rel}`;
+    controlsHtml = `<button class="revealbtn" id="revealBtn">Mostrar resposta</button>`;
+  } else if(dir==="es-pt"){
     const ctx = (state.cfg.showCtx && c.ex[0]) ? `<div class="frontctx">${renderContext(c.ex[0],c.esp,"hl").html}</div>` : "";
     frontHtml = `
        <div class="word">${esc(c.esp)}</div>
@@ -514,8 +560,9 @@ function render(){
        ${ctx}
        <div class="hint">o que significa? · toque para ver</div>
        ${cogHint}${knowBtn}`;
-    answerHtml = `<div class="pt">${esc(c.pt)}</div>${ptAlt}${exHtml}${trapHtml}${notesHtml}`;
-  }else{
+    answerHtml = `<div class="pt">${esc(c.pt)}</div>${ptAlt}${exHtml}${trapHtml}${notesHtml}${rel}`;
+    controlsHtml = `<button class="revealbtn" id="revealBtn">Mostrar resposta</button>`;
+  } else {
     // PT->ES: mostra significado + frase com lacuna (só se conseguiu achar a palavra)
     let cz="";
     if(state.cfg.showCtx && c.ex[0]){ const z=renderContext(c.ex[0],c.esp,"cloze"); if(z.found) cz=`<div class="frontctx">${z.html}</div>`; }
@@ -527,7 +574,8 @@ function render(){
        ${cogHint}${knowBtn}`;
     answerHtml = `<div class="pt" style="font-size:30px;color:#fff">${esc(c.esp)}</div>
        <button class="audiobtn" id="audioBtn" style="margin:8px auto 4px">🔊</button>
-       ${exHtml}${trapHtml}${notesHtml}`;
+       ${exHtml}${trapHtml}${notesHtml}${rel}`;
+    controlsHtml = `<button class="revealbtn" id="revealBtn">Mostrar resposta</button>`;
   }
 
   main.innerHTML = `
@@ -536,21 +584,37 @@ function render(){
        <span class="tag vol">${volTag}</span>
        <span class="tag">${esc(c.cat)}</span>
        ${c.ff?'<span class="tag ff">⚠ armadilha</span>':''}
-       ${practiceMode?'<span class="tag" style="margin-left:auto;background:rgba(56,189,248,.18);color:var(--accent)">🎯 treino</span>':statusTag(p,isNew)}
+       ${practiceMode?'<span class="tag" style="margin-left:auto;background:rgba(56,189,248,.18);color:var(--accent)">🎯 treino</span>':(modeTag||statusTag(p,isNew))}
      </div>
      <div class="front">${frontHtml}</div>
      <div class="answer" id="answer">${answerHtml}</div>
    </div>
-   <div class="controls" id="controls">
-     <button class="revealbtn" id="revealBtn">Mostrar resposta</button>
-   </div>`;
-  document.getElementById("card").onclick=(e)=>{ if(!e.target.closest("button")) reveal(); };
+   <div class="controls" id="controls">${controlsHtml}</div>`;
+  window._typeResult=null; window._typed="";
+  document.getElementById("card").onclick=(e)=>{ if(e.target.closest("button")||e.target.closest("input"))return; if(mode==="type")return; reveal(); };
   const ab=document.getElementById("audioBtn"); if(ab) ab.onclick=(e)=>{ e.stopPropagation(); speak(c.esp); };
   document.querySelectorAll(".play").forEach(b=>b.onclick=(e)=>{ e.stopPropagation(); speak(c.ex[+b.dataset.i]); });
   const kb=document.getElementById("knowBtn"); if(kb) kb.onclick=(e)=>{ e.stopPropagation(); markKnown(); };
-  document.getElementById("revealBtn").onclick=reveal;
-  if(state.cfg.autoplay && dir==="es-pt") setTimeout(()=>speak(c.esp),180);
+  const rb=document.getElementById("revealBtn"); if(rb) rb.onclick=reveal;
+  const tg=document.getElementById("typeGo"); if(tg) tg.onclick=submitType;
+  const ti=document.getElementById("typeIn"); if(ti){ ti.onkeydown=e=>{ if(e.key==="Enter"){ e.preventDefault(); submitType(); } }; setTimeout(()=>ti.focus(),60); }
+  if(mode==="listen"){ setTimeout(()=>speak(c.esp),250); }
+  else if(mode==="normal" && state.cfg.autoplay && dir==="es-pt"){ setTimeout(()=>speak(c.esp),180); }
   renderSessBar();
+}
+// DIGITAÇÃO: confere o que foi escrito contra a resposta e revela
+function submitType(){
+  const inp=document.getElementById("typeIn"); if(!inp) return;
+  const c=CARDS_ALL.find(x=>x.id===curId); if(!c){ reveal(); return; }
+  const typed=normWord(inp.value);
+  if(!typed){ inp.focus(); return; }
+  const cands=wordCandidates(c.esp).map(normWord);
+  cands.push(normWord(c.esp.replace(/\(.*?\)/g," ")));
+  let res="bad";
+  if(cands.some(x=>x && x===typed)) res="ok";
+  else { for(const x of cands){ if(x.length>=4 && lev(x,typed)<=1){ res="close"; break; } } }
+  window._typeResult=res; window._typed=inp.value;
+  reveal();
 }
 function statusTag(p, isNew){
   if(isNew) return '<span class="tag" style="margin-left:auto;background:rgba(129,140,248,.2);color:#c7d2fe">nova</span>';
@@ -563,7 +627,19 @@ function reveal(){
   document.getElementById("answer").classList.add("show");
   const c=CARDS_ALL.find(x=>x.id===curId);
   const dir = practiceMode ? practiceDir : state.cfg.dir;
-  if(state.cfg.autoplay && dir==="pt-es") setTimeout(()=>speak(c.esp),120);
+  const mode = practiceMode ? "normal" : (state.cfg.studyMode||"normal");
+  // feedback da digitação
+  if(mode==="type" && window._typeResult){
+    const r=window._typeResult, you=esc(window._typed||"—");
+    const banner = r==="ok"
+      ? '<div class="typeres" style="margin-bottom:10px;padding:8px 12px;border-radius:12px;font-weight:800;color:#86efac;background:rgba(34,197,94,.16)">✓ Acertou!</div>'
+      : r==="close"
+      ? `<div class="typeres" style="margin-bottom:10px;padding:8px 12px;border-radius:12px;font-weight:700;color:#fcd34d;background:rgba(245,158,11,.16)">≈ Quase! você escreveu «${you}»</div>`
+      : `<div class="typeres" style="margin-bottom:10px;padding:8px 12px;border-radius:12px;font-weight:700;color:#fca5a5;background:rgba(239,68,68,.16)">✗ Você escreveu «${you}»</div>`;
+    document.getElementById("answer").insertAdjacentHTML("afterbegin", banner);
+  }
+  if(mode==="type") setTimeout(()=>speak(c.esp),120);
+  else if(state.cfg.autoplay && dir==="pt-es") setTimeout(()=>speak(c.esp),120);
   const ctrls=document.getElementById("controls");
   if(practiceMode){
     ctrls.innerHTML=`<div class="rate" style="grid-template-columns:1fr 1fr">
@@ -599,7 +675,7 @@ function rate(grade){
 function markKnown(){
   const p=P(curId); const t=todayStr(); const wasNew=!p.intro;
   p.intro=true; if(!p.introDay) p.introDay=t; p.free=true;
-  p.learning=false; p.ease=2.6; p.ivl=180; p.due=Date.now()+180*DAY;
+  p.learning=false; p.ease=2.6; p.s=180; p.d=4; p.ivl=180; p.due=Date.now()+180*DAY;
   state.history[t]=(state.history[t]||0)+1; markStudiedToday(curId); updateStreak();
   const i=session.indexOf(curId); if(i>=0) session.splice(i,1);
   if(wasNew && realLearnedToday() < state.cfg.newLimit){
@@ -787,6 +863,15 @@ function cognateLevel(c){
   return (c._lvl=lvl);
 }
 function isCognate(c){ return cognateLevel(c)!=null; }
+// Relação com o português — mostra no VERSO de todo card pra treinar "é igual ou não?"
+function ptEsRelation(c){
+  if(c.ff || c.trap) return {t:"🔴 Falso amigo — parece português, mas NÃO é", c:"#fca5a5", bg:"rgba(239,68,68,.16)"};
+  const lvl=cognateLevel(c);
+  if(lvl==="igual")    return {t:"🟢 Igual ao português", c:"#86efac", bg:"rgba(34,197,94,.16)"};
+  if(lvl==="parecida") return {t:"🟡 Parecida — cuidado com grafia/acento", c:"#fcd34d", bg:"rgba(245,158,11,.16)"};
+  return {t:"🔵 Diferente do português — tem que decorar", c:"#93c5fd", bg:"rgba(59,130,246,.16)"};
+}
+function relBadge(c){ const r=ptEsRelation(c); return `<div class="relbadge" style="margin-top:12px;display:inline-block;padding:6px 12px;border-radius:999px;font-size:12.5px;font-weight:700;line-height:1.2;color:${r.c};background:${r.bg}">${r.t}</div>`; }
 
 /* ============ DECKS / COUNTS BAR ============ */
 const MAIN_DECKS=[
@@ -1011,6 +1096,7 @@ function openSettings(){
   document.getElementById("sessionSizeVal").textContent=cfg.sessionSize+" cards";
   document.getElementById("autoplay").checked=cfg.autoplay;
   document.getElementById("dirSel").value=cfg.dir;
+  document.getElementById("modeSel").value=cfg.studyMode||"normal";
   document.getElementById("showCtx").checked=cfg.showCtx;
   const rt=document.getElementById("rate"); rt.value=cfg.rate;
   document.getElementById("rateVal").textContent=cfg.rate+"x";
@@ -1106,15 +1192,27 @@ document.getElementById("sessionSize").oninput=e=>{
 document.getElementById("autoplay").onchange=e=>{state.cfg.autoplay=e.target.checked;save();};
 
 function updateDirBtn(){
-  document.getElementById("dirBtn").textContent = state.cfg.dir==="es-pt" ? "ES→PT" : "PT→ES";
+  const m=state.cfg.studyMode||"normal";
+  document.getElementById("dirBtn").textContent =
+    m==="type" ? "⌨ Digitar" : m==="listen" ? "🎧 Ditado" : (state.cfg.dir==="es-pt"?"ES→PT":"PT→ES");
 }
+// 1 toque cicla: ES→PT · PT→ES · ⌨ Digitar · 🎧 Ditado
 document.getElementById("dirBtn").onclick=()=>{
-  state.cfg.dir = state.cfg.dir==="es-pt" ? "pt-es" : "es-pt";
+  const m=state.cfg.studyMode||"normal";
+  if(m==="normal" && state.cfg.dir==="es-pt"){ state.cfg.dir="pt-es"; }
+  else if(m==="normal"){ state.cfg.studyMode="type"; }
+  else if(m==="type"){ state.cfg.studyMode="listen"; }
+  else { state.cfg.studyMode="normal"; state.cfg.dir="es-pt"; }
   save(); updateDirBtn();
-  toast(state.cfg.dir==="es-pt" ? "Modo reconhecer (ES→PT)" : "Modo evocar (PT→ES)");
+  const nm=state.cfg.studyMode;
+  toast(nm==="type"?"Modo digitar ⌨":nm==="listen"?"Modo ditado 🎧":(state.cfg.dir==="es-pt"?"Reconhecer ES→PT":"Evocar PT→ES"));
   refresh();
 };
 document.getElementById("dirSel").onchange=e=>{ state.cfg.dir=e.target.value; save(); updateDirBtn(); };
+document.getElementById("modeSel").onchange=e=>{
+  state.cfg.studyMode=e.target.value; save(); updateDirBtn();
+  toast(e.target.value==="type"?"Modo digitar ⌨":e.target.value==="listen"?"Modo ditado 🎧":"Modo normal 📖");
+};
 document.getElementById("showCtx").onchange=e=>{ state.cfg.showCtx=e.target.checked; save(); };
 document.getElementById("rate").oninput=e=>{
   state.cfg.rate=+e.target.value; document.getElementById("rateVal").textContent=state.cfg.rate+"x"; save();
@@ -1146,6 +1244,7 @@ function toast(msg){
 /* ============ KEYBOARD (desktop) ============ */
 document.addEventListener("keydown",e=>{
   if(document.querySelector(".overlay.show"))return;
+  if(/^(input|textarea|select)$/i.test(e.target.tagName))return; // não atrapalhar a digitação
   if(e.code==="Space"){ e.preventDefault(); revealed?null:reveal(); }
   if(revealed){ if(e.key==="1")rate(0); if(e.key==="2")rate(1); if(e.key==="3")rate(2); }
   if(e.key.toLowerCase()==="r"){ const c=CARDS_ALL.find(x=>x.id===curId); if(c)speak(c.esp); }
